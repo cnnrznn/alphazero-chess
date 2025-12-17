@@ -570,6 +570,14 @@ class MCTS:
 # Batched GPU Inference (for high GPU utilization)
 # ============================================================================
 
+@dataclass
+class GameSample:
+    """A single training sample from self-play."""
+    state: np.ndarray
+    policy: np.ndarray
+    value: float
+
+
 class BatchedInferenceServer:
     """
     Collects inference requests from multiple games and batches them together.
@@ -905,14 +913,8 @@ def batched_gpu_self_play(network: AlphaZeroNet, device: torch.device,
 
 
 # ============================================================================
-# Self-Play
+# Self-Play (CPU parallel)
 # ============================================================================
-
-@dataclass
-class GameSample:
-    state: np.ndarray
-    policy: np.ndarray
-    value: float
 
 def _self_play_worker(network_state: dict, cfg: Config, seed: int) -> list[GameSample]:
     """Worker function for parallel self-play"""
