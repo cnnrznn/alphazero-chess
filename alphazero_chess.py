@@ -12,8 +12,7 @@ import queue
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # Enable MPS fallback for unsupported operations on Apple Silicon
@@ -32,42 +31,36 @@ import chess
 
 @dataclass
 class Config:
-    # Neural network (reduced for CPU)
-    num_res_blocks: int = 5  # Reduced from 19
-    num_filters: int = 64    # Reduced from 256
+    # Neural network
+    num_res_blocks: int = 5
+    num_filters: int = 64
 
-    # MCTS (reduced for CPU)
-    num_simulations: int = 100  # Reduced from 800
+    # MCTS
+    num_simulations: int = 100
     c_puct: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
-
-    # Parallel MCTS
-    virtual_loss: float = 1.0  # For parallel tree search
-    batch_eval_size: int = 8   # Batch multiple positions for inference
+    virtual_loss: float = 1.0
+    batch_eval_size: int = 8   # Simulations batched per MCTS search
 
     # Training
-    batch_size: int = 64      # Reduced from 256
-    learning_rate: float = 0.01  # Reduced from 0.2
+    batch_size: int = 64
+    learning_rate: float = 0.01
     weight_decay: float = 1e-4
     momentum: float = 0.9
     num_epochs: int = 1
-    num_workers: int = 4      # DataLoader workers
+    num_workers: int = 0      # DataLoader workers
 
-    # Self-play (reduced for CPU)
-    num_actors: int = 100     # Reduced from 5000
-    max_moves: int = 200      # Reduced from 512
-    temperature_threshold: int = 15  # Reduced from 30
-    num_parallel_games: int = mp.cpu_count() # Parallel self-play games
+    # Self-play
+    max_moves: int = 200
+    temperature_threshold: int = 15
+    num_gpu_games: int = 4         # Parallel games during self-play
+    gpu_batch_size: int = 16       # Batch size for inference server
+    gpu_batch_timeout: float = 0.001
 
     # Replay buffer
-    buffer_size: int = 50_000      # Reduced from 1_000_000
-    min_buffer_size: int = 1_000   # Reduced from 10_000
-
-    # Batched GPU inference (for CUDA)
-    gpu_batch_size: int = 32       # Batch size for GPU inference across games
-    gpu_batch_timeout: float = 0.001  # Max wait time (seconds) to fill batch
-    num_gpu_games: int = 8         # Number of parallel games on GPU
+    buffer_size: int = 50_000
+    min_buffer_size: int = 1_000
 
 
 def get_device() -> torch.device:
@@ -84,29 +77,31 @@ def get_config_for_device(device: torch.device) -> Config:
     cfg = Config()
 
     if device.type == 'cuda':
-        # NVIDIA GPU (e.g., 3090 with 24GB VRAM) - use larger settings
+        # NVIDIA GPU - large batches, many parallel games
         cfg.num_res_blocks = 10
         cfg.num_filters = 128
         cfg.batch_size = 256
-        cfg.num_simulations = 400
+        cfg.num_simulations = 800
         cfg.num_workers = 4
         cfg.buffer_size = 200_000
         cfg.min_buffer_size = 5_000
-        # Batched GPU inference settings
-        cfg.gpu_batch_size = 64
-        cfg.num_gpu_games = 16
+        cfg.gpu_batch_size = 128
+        cfg.batch_eval_size = 16
+        cfg.num_gpu_games = 32
 
     elif device.type == 'mps':
-        # Apple Silicon (e.g., M2 Pro) - good GPU but shared memory
+        # Apple Silicon - moderate settings
         cfg.num_res_blocks = 8
         cfg.num_filters = 96
         cfg.batch_size = 128
         cfg.num_simulations = 200
-        cfg.num_workers = 0  # MPS doesn't benefit from DataLoader workers
         cfg.buffer_size = 100_000
         cfg.min_buffer_size = 2_000
+        cfg.gpu_batch_size = 32
+        cfg.batch_eval_size = 8
+        cfg.num_gpu_games = 8
 
-    # CPU uses default reduced settings from Config class
+    # CPU uses defaults from Config class
     return cfg
 
 
@@ -308,7 +303,7 @@ class AlphaZeroNet(nn.Module):
 
 class MCTSNode:
     __slots__ = ['parent', 'move', 'prior', 'children', 'visit_count',
-                 'value_sum', 'board', 'virtual_loss']
+                 'value_sum', 'board', 'virtual_loss', '_cached_value']
 
     def __init__(self, parent: Optional['MCTSNode'], move: Optional[chess.Move],
                  prior: float, board: chess.Board):
@@ -329,245 +324,8 @@ class MCTSNode:
     def is_expanded(self) -> bool:
         return len(self.children) > 0
 
-class MCTS:
-    def __init__(self, cfg: Config, network: AlphaZeroNet, device: torch.device):
-        self.cfg = cfg
-        self.network = network
-        self.device = device
-        self.eval_cache = {}  # Cache for board evaluations
-
-    def clear_cache(self):
-        """Clear evaluation cache to free memory"""
-        self.eval_cache.clear()
-
-    def search(self, board: chess.Board, add_noise: bool = True) -> np.ndarray:
-        root = MCTSNode(None, None, 0.0, board.copy())
-
-        # Use inference mode for better CPU performance
-        with torch.inference_mode():
-            self._expand_single(root)
-
-            # Add Dirichlet noise to root
-            if add_noise and root.children:
-                noise = np.random.dirichlet([self.cfg.dirichlet_alpha] * len(root.children))
-                for i, child in enumerate(root.children.values()):
-                    child.prior = (1 - self.cfg.dirichlet_epsilon) * child.prior + \
-                                  self.cfg.dirichlet_epsilon * noise[i]
-
-            # Run simulations in batches
-            num_batches = self.cfg.num_simulations // self.cfg.batch_eval_size
-            for _ in range(num_batches):
-                search_paths = []
-                nodes_to_eval = []
-
-                # Collect batch of nodes
-                for _ in range(self.cfg.batch_eval_size):
-                    node = root
-                    search_path = [node]
-
-                    # Select with virtual loss
-                    while node.is_expanded() and not node.board.is_game_over():
-                        node = self._select_child(node)
-                        search_path.append(node)
-                        # Add virtual loss to discourage other threads from selecting same path
-                        node.virtual_loss += self.cfg.virtual_loss
-
-                    search_paths.append(search_path)
-                    if not node.board.is_game_over() and not node.is_expanded():
-                        nodes_to_eval.append(node)
-
-                # Batch evaluate all nodes
-                if nodes_to_eval:
-                    values = self._batch_expand_and_evaluate(nodes_to_eval)
-                else:
-                    values = []
-
-                # Process results
-                eval_idx = 0
-                for search_path in search_paths:
-                    node = search_path[-1]
-
-                    # Remove virtual loss
-                    for n in search_path[1:]:
-                        n.virtual_loss -= self.cfg.virtual_loss
-
-                    # Get value
-                    if node.board.is_game_over():
-                        result = node.board.result()
-                        if result == "1-0":
-                            value = 1.0 if node.board.turn == chess.BLACK else -1.0
-                        elif result == "0-1":
-                            value = 1.0 if node.board.turn == chess.WHITE else -1.0
-                        else:
-                            value = 0.0
-                    else:
-                        value = values[eval_idx] if eval_idx < len(values) else 0.0
-                        eval_idx += 1
-
-                    # Backpropagate
-                    self._backpropagate(search_path, value)
-
-        # Build policy from visit counts
-        policy = np.zeros(NUM_MOVES, dtype=np.float32)
-        for move, child in root.children.items():
-            policy[encode_move(move)] = child.visit_count
-
-        if policy.sum() > 0:
-            policy /= policy.sum()
-
-        return policy
-    
-    def _select_child(self, node: MCTSNode) -> MCTSNode:
-        best_score = -float('inf')
-        best_child = None
-        
-        sqrt_parent = math.sqrt(node.visit_count)
-        
-        for child in node.children.values():
-            # UCB formula
-            q_value = -child.value()  # Negated for opponent's perspective
-            u_value = self.cfg.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
-            score = q_value + u_value
-            
-            if score > best_score:
-                best_score = score
-                best_child = child
-        
-        return best_child
-    
-    def _expand_single(self, node: MCTSNode):
-        """Expand a single node (used for root)"""
-        if node.board.is_game_over():
-            return
-
-        # Check cache first
-        board_fen = node.board.fen()
-        if board_fen in self.eval_cache:
-            policy, _ = self.eval_cache[board_fen]
-        else:
-            # Get policy from network
-            state = torch.from_numpy(encode_board(node.board)).unsqueeze(0).to(self.device)
-            policy_logits, value = self.network(state)
-
-            policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-            # Cache result
-            self.eval_cache[board_fen] = (policy, value.item())
-            # Limit cache size
-            if len(self.eval_cache) > 10000:
-                # Remove oldest entries (simple FIFO)
-                self.eval_cache.pop(next(iter(self.eval_cache)))
-
-        # Create children for legal moves
-        legal_moves = list(node.board.legal_moves)
-        priors = np.array([policy[encode_move(m)] for m in legal_moves])
-
-        if priors.sum() > 0:
-            priors /= priors.sum()
-        else:
-            priors = np.ones(len(legal_moves)) / len(legal_moves)
-
-        for move, prior in zip(legal_moves, priors):
-            child_board = node.board.copy()
-            child_board.push(move)
-            node.children[move] = MCTSNode(node, move, prior, child_board)
-
-    def _batch_expand_and_evaluate(self, nodes: list[MCTSNode]) -> list[float]:
-        """Batch expand and evaluate multiple nodes"""
-        if not nodes:
-            return []
-
-        # Check cache and collect uncached nodes
-        results = [None] * len(nodes)
-        states_to_eval = []
-        indices_to_eval = []
-
-        for i, node in enumerate(nodes):
-            if node.board.is_game_over():
-                continue
-
-            board_fen = node.board.fen()
-            if board_fen in self.eval_cache:
-                policy, value = self.eval_cache[board_fen]
-                results[i] = (policy, value)
-            else:
-                states_to_eval.append(encode_board(node.board))
-                indices_to_eval.append(i)
-
-        # Batch evaluate uncached positions
-        if states_to_eval:
-            states_tensor = torch.from_numpy(np.array(states_to_eval)).to(self.device)
-            policy_logits, values = self.network(states_tensor)
-            policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-            values_np = values.squeeze(-1).cpu().numpy()
-
-            for idx, node_idx in enumerate(indices_to_eval):
-                node = nodes[node_idx]
-                policy = policies[idx]
-                value = float(values_np[idx])
-                results[node_idx] = (policy, value)
-
-                # Cache result
-                board_fen = node.board.fen()
-                self.eval_cache[board_fen] = (policy, value)
-                if len(self.eval_cache) > 10000:
-                    self.eval_cache.pop(next(iter(self.eval_cache)))
-
-        # Expand all nodes and return values
-        values = []
-        for i, node in enumerate(nodes):
-            if results[i] is None:
-                values.append(0.0)
-                continue
-
-            policy, value = results[i]
-            values.append(value)
-
-            # Create children
-            legal_moves = list(node.board.legal_moves)
-            priors = np.array([policy[encode_move(m)] for m in legal_moves])
-
-            if priors.sum() > 0:
-                priors /= priors.sum()
-            else:
-                priors = np.ones(len(legal_moves)) / len(legal_moves)
-
-            for move, prior in zip(legal_moves, priors):
-                child_board = node.board.copy()
-                child_board.push(move)
-                node.children[move] = MCTSNode(node, move, prior, child_board)
-
-        return values
-
-    def _evaluate(self, board: chess.Board) -> float:
-        # Check cache first
-        board_fen = board.fen()
-        if board_fen in self.eval_cache:
-            _, value = self.eval_cache[board_fen]
-            return value
-
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            policy_logits, value = self.network(state)
-
-        policy = F.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-        value_item = value.item()
-        # Cache result
-        self.eval_cache[board_fen] = (policy, value_item)
-        # Limit cache size
-        if len(self.eval_cache) > 10000:
-            self.eval_cache.pop(next(iter(self.eval_cache)))
-
-        return value_item
-
-    def _backpropagate(self, path: list[MCTSNode], value: float):
-        for node in reversed(path):
-            node.visit_count += 1
-            node.value_sum += value
-            value = -value  # Flip for opponent
-
-
 # ============================================================================
-# Batched GPU Inference (for high GPU utilization)
+# Inference Server (batches neural network calls across games)
 # ============================================================================
 
 @dataclass
@@ -578,7 +336,7 @@ class GameSample:
     value: float
 
 
-class BatchedInferenceServer:
+class InferenceServer:
     """
     Collects inference requests from multiple games and batches them together.
     Runs in a background thread, processes batches on GPU.
@@ -714,10 +472,10 @@ class BatchedInferenceServer:
             self.eval_cache.clear()
 
 
-class BatchedMCTS:
-    """MCTS that uses BatchedInferenceServer for GPU-efficient inference."""
+class MCTS:
+    """MCTS that uses InferenceServer for GPU-efficient inference."""
 
-    def __init__(self, cfg: Config, inference_server: BatchedInferenceServer):
+    def __init__(self, cfg: Config, inference_server: InferenceServer):
         self.cfg = cfg
         self.server = inference_server
 
@@ -734,30 +492,60 @@ class BatchedMCTS:
                 child.prior = (1 - self.cfg.dirichlet_epsilon) * child.prior + \
                               self.cfg.dirichlet_epsilon * noise[i]
 
-        # Run simulations
-        for _ in range(self.cfg.num_simulations):
-            node = root
-            search_path = [node]
+        # Run simulations in batches for better GPU utilization
+        sims_done = 0
+        batch_size = self.cfg.batch_eval_size
 
-            # Select
-            while node.is_expanded() and not node.board.is_game_over():
-                node = self._select_child(node)
-                search_path.append(node)
+        while sims_done < self.cfg.num_simulations:
+            # Collect multiple search paths using virtual loss
+            search_paths = []
+            nodes_to_expand = []
 
-            # Expand and evaluate
-            if node.board.is_game_over():
-                result = node.board.result()
-                if result == "1-0":
-                    value = 1.0 if node.board.turn == chess.BLACK else -1.0
-                elif result == "0-1":
-                    value = 1.0 if node.board.turn == chess.WHITE else -1.0
+            for _ in range(min(batch_size, self.cfg.num_simulations - sims_done)):
+                node = root
+                search_path = [node]
+
+                # Select with virtual loss to diversify paths
+                while node.is_expanded() and not node.board.is_game_over():
+                    node = self._select_child(node)
+                    search_path.append(node)
+                    node.virtual_loss += self.cfg.virtual_loss
+
+                search_paths.append(search_path)
+
+                if not node.board.is_game_over() and not node.is_expanded():
+                    nodes_to_expand.append((len(search_paths) - 1, node))
+
+            # Batch expand all nodes that need expansion
+            if nodes_to_expand:
+                self._batch_expand(nodes_to_expand)
+
+            # Process all paths: get values and backpropagate
+            for path_idx, search_path in enumerate(search_paths):
+                node = search_path[-1]
+
+                # Remove virtual loss
+                for n in search_path[1:]:
+                    n.virtual_loss -= self.cfg.virtual_loss
+
+                # Get value
+                if node.board.is_game_over():
+                    result = node.board.result()
+                    if result == "1-0":
+                        value = 1.0 if node.board.turn == chess.BLACK else -1.0
+                    elif result == "0-1":
+                        value = 1.0 if node.board.turn == chess.WHITE else -1.0
+                    else:
+                        value = 0.0
+                elif hasattr(node, '_cached_value'):
+                    value = node._cached_value
+                    del node._cached_value
                 else:
                     value = 0.0
-            else:
-                value = self._expand(node)
 
-            # Backpropagate
-            self._backpropagate(search_path, value)
+                # Backpropagate
+                self._backpropagate(search_path, value)
+                sims_done += 1
 
         # Build policy from visit counts
         policy = np.zeros(NUM_MOVES, dtype=np.float32)
@@ -809,6 +597,57 @@ class BatchedMCTS:
 
         return value
 
+    def _batch_expand(self, nodes_to_expand: list[tuple[int, MCTSNode]]):
+        """Expand multiple nodes in parallel using the inference server."""
+        if not nodes_to_expand:
+            return
+
+        # Submit all boards concurrently (they'll be batched by the server)
+        results = [None] * len(nodes_to_expand)
+
+        def expand_one(idx, path_idx, node):
+            if node.board.is_game_over() or node.is_expanded():
+                return
+            policy, value = self.server.submit(node.board)
+            results[idx] = (path_idx, node, policy, value)
+
+        # Use threads to submit all requests (they block on server.submit)
+        threads = []
+        for idx, (path_idx, node) in enumerate(nodes_to_expand):
+            t = threading.Thread(target=expand_one, args=(idx, path_idx, node))
+            t.start()
+            threads.append(t)
+
+        # Wait for all to complete
+        for t in threads:
+            t.join()
+
+        # Process results - create children and cache values
+        for result in results:
+            if result is None:
+                continue
+            path_idx, node, policy, value = result
+
+            if node.is_expanded():  # Another thread might have expanded it
+                continue
+
+            # Create children
+            legal_moves = list(node.board.legal_moves)
+            priors = np.array([policy[encode_move(m)] for m in legal_moves])
+
+            if priors.sum() > 0:
+                priors /= priors.sum()
+            else:
+                priors = np.ones(len(legal_moves)) / len(legal_moves)
+
+            for move, prior in zip(legal_moves, priors):
+                child_board = node.board.copy()
+                child_board.push(move)
+                node.children[move] = MCTSNode(node, move, prior, child_board)
+
+            # Cache value for backpropagation
+            node._cached_value = value
+
     def _backpropagate(self, path: list[MCTSNode], value: float):
         for node in reversed(path):
             node.visit_count += 1
@@ -816,10 +655,10 @@ class BatchedMCTS:
             value = -value
 
 
-def _batched_self_play_worker(server: BatchedInferenceServer, cfg: Config,
+def _self_play_worker(server: InferenceServer, cfg: Config,
                                game_id: int, results: list, results_lock: threading.Lock):
     """Worker function for batched self-play (runs in thread)."""
-    mcts = BatchedMCTS(cfg, server)
+    mcts = MCTS(cfg, server)
     samples = []
 
     board = chess.Board()
@@ -873,14 +712,14 @@ def _batched_self_play_worker(server: BatchedInferenceServer, cfg: Config,
         results.extend(samples)
 
 
-def batched_gpu_self_play(network: AlphaZeroNet, device: torch.device,
+def self_play(network: AlphaZeroNet, device: torch.device,
                           cfg: Config, num_games: int) -> list[GameSample]:
     """
     Run multiple self-play games in parallel with batched GPU inference.
     Much higher GPU utilization than sequential self-play.
     """
     # Create inference server
-    server = BatchedInferenceServer(network, device, cfg)
+    server = InferenceServer(network, device, cfg)
     server.start()
 
     results = []
@@ -892,7 +731,7 @@ def batched_gpu_self_play(network: AlphaZeroNet, device: torch.device,
             futures = []
             for i in range(num_games):
                 future = executor.submit(
-                    _batched_self_play_worker,
+                    _self_play_worker,
                     server, cfg, i, results, results_lock
                 )
                 futures.append(future)
@@ -911,111 +750,6 @@ def batched_gpu_self_play(network: AlphaZeroNet, device: torch.device,
 
     return results
 
-
-# ============================================================================
-# Self-Play (CPU parallel)
-# ============================================================================
-
-def _self_play_worker(network_state: dict, cfg: Config, seed: int) -> list[GameSample]:
-    """Worker function for parallel self-play"""
-    np.random.seed(seed)
-    random.seed(seed)
-
-    # Create network and MCTS in worker process
-    device = torch.device('cpu')
-    network = AlphaZeroNet(cfg).to(device)
-    network.load_state_dict(network_state)
-    network.eval()
-
-    mcts = MCTS(cfg, network, device)
-    return self_play_game(mcts, cfg)
-
-def self_play_game(mcts: MCTS, cfg: Config) -> list[GameSample]:
-    board = chess.Board()
-    samples = []
-    move_count = 0
-
-    # Clear cache at start of game to free memory
-    mcts.clear_cache()
-
-    while not board.is_game_over() and move_count < cfg.max_moves:
-        # Get MCTS policy
-        policy = mcts.search(board, add_noise=True)
-        
-        # Store sample
-        samples.append(GameSample(
-            state=encode_board(board),
-            policy=policy.copy(),
-            value=0.0  # Will be filled later
-        ))
-        
-        # Select move
-        if move_count < cfg.temperature_threshold:
-            # Sample proportionally
-            probs = policy / policy.sum() if policy.sum() > 0 else np.ones(len(policy)) / len(policy)
-            move_idx = np.random.choice(len(policy), p=probs)
-        else:
-            # Greedy
-            move_idx = np.argmax(policy)
-        
-        # Find corresponding legal move
-        legal_moves = list(board.legal_moves)
-        move_probs = [(m, policy[encode_move(m)]) for m in legal_moves]
-        move_probs.sort(key=lambda x: x[1], reverse=True)
-        
-        if move_count < cfg.temperature_threshold:
-            weights = [p for _, p in move_probs]
-            total = sum(weights)
-            if total > 0:
-                weights = [w / total for w in weights]
-                move = random.choices([m for m, _ in move_probs], weights=weights)[0]
-            else:
-                move = random.choice(legal_moves)
-        else:
-            move = move_probs[0][0]
-        
-        board.push(move)
-        move_count += 1
-    
-    # Determine game result
-    result = board.result()
-    if result == "1-0":
-        final_value = 1.0
-    elif result == "0-1":
-        final_value = -1.0
-    else:
-        final_value = 0.0
-    
-    # Assign values (alternating perspective)
-    for i, sample in enumerate(samples):
-        sample.value = final_value if i % 2 == 0 else -final_value
-    
-    return samples
-
-def parallel_self_play(network: AlphaZeroNet, cfg: Config, num_games: int) -> list[GameSample]:
-    """Generate multiple self-play games in parallel"""
-    # Move state dict to CPU for worker processes (works from any device: CUDA, MPS, CPU)
-    network_state = {k: v.cpu() for k, v in network.state_dict().items()}
-    all_samples = []
-
-    # Use ProcessPoolExecutor for true parallelism
-    with ProcessPoolExecutor(max_workers=cfg.num_parallel_games) as executor:
-        futures = []
-        for i in range(num_games):
-            seed = random.randint(0, 2**31 - 1)
-            future = executor.submit(_self_play_worker, network_state, cfg, seed)
-            futures.append(future)
-
-        # Collect results as they complete
-        for i, future in enumerate(as_completed(futures)):
-            try:
-                samples = future.result()
-                all_samples.extend(samples)
-                print(f"  Game {i + 1}/{num_games} completed: {len(samples)} moves")
-            except Exception as e:
-                print(f"  Game {i + 1}/{num_games} failed: {e}")
-
-    return all_samples
 
 # ============================================================================
 # Training
@@ -1197,8 +931,7 @@ def train_alphazero(cfg: Optional[Config] = None, resume_from: Optional[str] = N
         weight_decay=cfg.weight_decay
     )
 
-    # Initialize MCTS and replay buffer
-    mcts = MCTS(cfg, network, device)
+    # Initialize replay buffer
     replay_buffer = ReplayBuffer(cfg.buffer_size)
 
     iteration = 0
@@ -1232,34 +965,10 @@ def train_alphazero(cfg: Optional[Config] = None, resume_from: Optional[str] = N
 
         # Self-play phase
         network.eval()
-
-        # Games per iteration depends on device
-        if device.type == 'cuda':
-            games_per_iteration = cfg.num_gpu_games
-        elif device.type == 'mps':
-            games_per_iteration = 5
-        else:
-            games_per_iteration = 3
-
-        if device.type == 'cuda':
-            # CUDA: Use batched GPU inference for high utilization
-            print(f"Self-play (batched GPU, {cfg.num_gpu_games} parallel games)...")
-            samples = batched_gpu_self_play(network, device, cfg, games_per_iteration)
-            replay_buffer.add(samples)
-            print(f"  Total samples collected: {len(samples)}")
-        elif device.type in ('cpu', 'mps') and cfg.num_parallel_games > 1:
-            # CPU/MPS: Use parallel CPU workers
-            print(f"Self-play (parallel on {cfg.num_parallel_games} CPU workers)...")
-            samples = parallel_self_play(network, cfg, games_per_iteration)
-            replay_buffer.add(samples)
-            print(f"  Total samples collected: {len(samples)}")
-        else:
-            # Fallback: Sequential self-play
-            print(f"Self-play (sequential)...")
-            for game_num in range(games_per_iteration):
-                samples = self_play_game(mcts, cfg)
-                replay_buffer.add(samples)
-                print(f"  Game {game_num + 1}: {len(samples)} moves")
+        print(f"Self-play ({cfg.num_gpu_games} parallel games)...")
+        samples = self_play(network, device, cfg, cfg.num_gpu_games)
+        replay_buffer.add(samples)
+        print(f"  Total samples collected: {len(samples)}")
 
         # Training phase - use DataLoader for efficient batching
         if len(replay_buffer) >= cfg.min_buffer_size:
