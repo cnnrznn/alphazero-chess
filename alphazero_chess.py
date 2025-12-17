@@ -1049,9 +1049,6 @@ def play_against_ai(model_path: Optional[str] = None, cfg: Config = Config()):
     print(f"Game over: {board.result()}")
 
 if __name__ == "__main__":
-    # Required for multiprocessing on Windows/macOS
-    mp.set_start_method('spawn', force=True)
-
     import sys
     import argparse
 
