@@ -7,10 +7,12 @@ Requires: torch, numpy, python-chess
 import math
 import os
 import random
+import threading
+import queue
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 import numpy as np
 
@@ -62,6 +64,11 @@ class Config:
     buffer_size: int = 50_000      # Reduced from 1_000_000
     min_buffer_size: int = 1_000   # Reduced from 10_000
 
+    # Batched GPU inference (for CUDA)
+    gpu_batch_size: int = 32       # Batch size for GPU inference across games
+    gpu_batch_timeout: float = 0.001  # Max wait time (seconds) to fill batch
+    num_gpu_games: int = 8         # Number of parallel games on GPU
+
 
 def get_device() -> torch.device:
     """Detect the best available device (CUDA > MPS > CPU)."""
@@ -85,6 +92,9 @@ def get_config_for_device(device: torch.device) -> Config:
         cfg.num_workers = 4
         cfg.buffer_size = 200_000
         cfg.min_buffer_size = 5_000
+        # Batched GPU inference settings
+        cfg.gpu_batch_size = 64
+        cfg.num_gpu_games = 16
 
     elif device.type == 'mps':
         # Apple Silicon (e.g., M2 Pro) - good GPU but shared memory
@@ -548,12 +558,351 @@ class MCTS:
             self.eval_cache.pop(next(iter(self.eval_cache)))
 
         return value_item
-    
+
     def _backpropagate(self, path: list[MCTSNode], value: float):
         for node in reversed(path):
             node.visit_count += 1
             node.value_sum += value
             value = -value  # Flip for opponent
+
+
+# ============================================================================
+# Batched GPU Inference (for high GPU utilization)
+# ============================================================================
+
+class BatchedInferenceServer:
+    """
+    Collects inference requests from multiple games and batches them together.
+    Runs in a background thread, processes batches on GPU.
+    """
+    def __init__(self, network: AlphaZeroNet, device: torch.device, cfg: Config):
+        self.network = network
+        self.device = device
+        self.cfg = cfg
+
+        self.request_queue = queue.Queue()
+        self.running = False
+        self.worker_thread = None
+
+        # Cache for evaluated positions
+        self.eval_cache = {}
+        self.cache_lock = threading.Lock()
+
+    def start(self):
+        """Start the inference worker thread."""
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+
+    def stop(self):
+        """Stop the inference worker thread."""
+        self.running = False
+        if self.worker_thread:
+            self.worker_thread.join(timeout=1.0)
+
+    def submit(self, board: chess.Board) -> tuple[np.ndarray, float]:
+        """
+        Submit a board for evaluation. Blocks until result is ready.
+        Returns (policy, value).
+        """
+        # Check cache first
+        board_fen = board.fen()
+        with self.cache_lock:
+            if board_fen in self.eval_cache:
+                return self.eval_cache[board_fen]
+
+        # Create result container and submit request
+        result_event = threading.Event()
+        result_container = {}
+
+        self.request_queue.put((board, board_fen, result_event, result_container))
+
+        # Wait for result
+        result_event.wait()
+        return result_container['policy'], result_container['value']
+
+    def _worker_loop(self):
+        """Background worker that batches and processes requests."""
+        self.network.eval()
+
+        while self.running:
+            batch = []
+
+            # Collect requests up to batch size or timeout
+            try:
+                # Wait for at least one request
+                item = self.request_queue.get(timeout=0.1)
+                batch.append(item)
+
+                # Try to fill the batch
+                deadline = threading.Event()
+                while len(batch) < self.cfg.gpu_batch_size:
+                    try:
+                        item = self.request_queue.get(timeout=self.cfg.gpu_batch_timeout)
+                        batch.append(item)
+                    except queue.Empty:
+                        break
+
+            except queue.Empty:
+                continue
+
+            if not batch:
+                continue
+
+            # Process batch
+            self._process_batch(batch)
+
+    def _process_batch(self, batch: list):
+        """Process a batch of inference requests."""
+        boards, fens, events, containers = [], [], [], []
+
+        for board, fen, event, container in batch:
+            # Check cache again (might have been computed by another request)
+            with self.cache_lock:
+                if fen in self.eval_cache:
+                    policy, value = self.eval_cache[fen]
+                    container['policy'] = policy
+                    container['value'] = value
+                    event.set()
+                    continue
+
+            boards.append(board)
+            fens.append(fen)
+            events.append(event)
+            containers.append(container)
+
+        if not boards:
+            return
+
+        # Encode boards and run inference
+        states = np.array([encode_board(b) for b in boards])
+        states_tensor = torch.from_numpy(states).to(self.device)
+
+        with torch.inference_mode():
+            policy_logits, values = self.network(states_tensor)
+            policies = F.softmax(policy_logits, dim=1).cpu().numpy()
+            values_np = values.squeeze(-1).cpu().numpy()
+
+        # Distribute results
+        with self.cache_lock:
+            for i in range(len(boards)):
+                policy = policies[i]
+                value = float(values_np[i])
+
+                # Cache result
+                self.eval_cache[fens[i]] = (policy, value)
+                if len(self.eval_cache) > 50000:
+                    # Remove oldest entry
+                    self.eval_cache.pop(next(iter(self.eval_cache)))
+
+                # Return result to waiting thread
+                containers[i]['policy'] = policy
+                containers[i]['value'] = value
+                events[i].set()
+
+    def clear_cache(self):
+        """Clear the evaluation cache."""
+        with self.cache_lock:
+            self.eval_cache.clear()
+
+
+class BatchedMCTS:
+    """MCTS that uses BatchedInferenceServer for GPU-efficient inference."""
+
+    def __init__(self, cfg: Config, inference_server: BatchedInferenceServer):
+        self.cfg = cfg
+        self.server = inference_server
+
+    def search(self, board: chess.Board, add_noise: bool = True) -> np.ndarray:
+        root = MCTSNode(None, None, 0.0, board.copy())
+
+        # Expand root
+        self._expand(root)
+
+        # Add Dirichlet noise to root
+        if add_noise and root.children:
+            noise = np.random.dirichlet([self.cfg.dirichlet_alpha] * len(root.children))
+            for i, child in enumerate(root.children.values()):
+                child.prior = (1 - self.cfg.dirichlet_epsilon) * child.prior + \
+                              self.cfg.dirichlet_epsilon * noise[i]
+
+        # Run simulations
+        for _ in range(self.cfg.num_simulations):
+            node = root
+            search_path = [node]
+
+            # Select
+            while node.is_expanded() and not node.board.is_game_over():
+                node = self._select_child(node)
+                search_path.append(node)
+
+            # Expand and evaluate
+            if node.board.is_game_over():
+                result = node.board.result()
+                if result == "1-0":
+                    value = 1.0 if node.board.turn == chess.BLACK else -1.0
+                elif result == "0-1":
+                    value = 1.0 if node.board.turn == chess.WHITE else -1.0
+                else:
+                    value = 0.0
+            else:
+                value = self._expand(node)
+
+            # Backpropagate
+            self._backpropagate(search_path, value)
+
+        # Build policy from visit counts
+        policy = np.zeros(NUM_MOVES, dtype=np.float32)
+        for move, child in root.children.items():
+            policy[encode_move(move)] = child.visit_count
+
+        if policy.sum() > 0:
+            policy /= policy.sum()
+
+        return policy
+
+    def _select_child(self, node: MCTSNode) -> MCTSNode:
+        best_score = -float('inf')
+        best_child = None
+        sqrt_parent = math.sqrt(node.visit_count)
+
+        for child in node.children.values():
+            q_value = -child.value()
+            u_value = self.cfg.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
+            score = q_value + u_value
+
+            if score > best_score:
+                best_score = score
+                best_child = child
+
+        return best_child
+
+    def _expand(self, node: MCTSNode) -> float:
+        """Expand node using batched inference server."""
+        if node.board.is_game_over():
+            return 0.0
+
+        # Get policy and value from inference server (may batch with other games)
+        policy, value = self.server.submit(node.board)
+
+        # Create children for legal moves
+        legal_moves = list(node.board.legal_moves)
+        priors = np.array([policy[encode_move(m)] for m in legal_moves])
+
+        if priors.sum() > 0:
+            priors /= priors.sum()
+        else:
+            priors = np.ones(len(legal_moves)) / len(legal_moves)
+
+        for move, prior in zip(legal_moves, priors):
+            child_board = node.board.copy()
+            child_board.push(move)
+            node.children[move] = MCTSNode(node, move, prior, child_board)
+
+        return value
+
+    def _backpropagate(self, path: list[MCTSNode], value: float):
+        for node in reversed(path):
+            node.visit_count += 1
+            node.value_sum += value
+            value = -value
+
+
+def _batched_self_play_worker(server: BatchedInferenceServer, cfg: Config,
+                               game_id: int, results: list, results_lock: threading.Lock):
+    """Worker function for batched self-play (runs in thread)."""
+    mcts = BatchedMCTS(cfg, server)
+    samples = []
+
+    board = chess.Board()
+    move_count = 0
+
+    while not board.is_game_over() and move_count < cfg.max_moves:
+        # Get MCTS policy
+        policy = mcts.search(board, add_noise=True)
+
+        # Store sample
+        samples.append(GameSample(
+            state=encode_board(board),
+            policy=policy.copy(),
+            value=0.0
+        ))
+
+        # Select move
+        legal_moves = list(board.legal_moves)
+        move_probs = [(m, policy[encode_move(m)]) for m in legal_moves]
+        move_probs.sort(key=lambda x: x[1], reverse=True)
+
+        if move_count < cfg.temperature_threshold:
+            weights = [p for _, p in move_probs]
+            total = sum(weights)
+            if total > 0:
+                weights = [w / total for w in weights]
+                move = random.choices([m for m, _ in move_probs], weights=weights)[0]
+            else:
+                move = random.choice(legal_moves)
+        else:
+            move = move_probs[0][0]
+
+        board.push(move)
+        move_count += 1
+
+    # Determine game result
+    result = board.result()
+    if result == "1-0":
+        final_value = 1.0
+    elif result == "0-1":
+        final_value = -1.0
+    else:
+        final_value = 0.0
+
+    # Assign values
+    for i, sample in enumerate(samples):
+        sample.value = final_value if i % 2 == 0 else -final_value
+
+    # Store results thread-safely
+    with results_lock:
+        results.extend(samples)
+
+
+def batched_gpu_self_play(network: AlphaZeroNet, device: torch.device,
+                          cfg: Config, num_games: int) -> list[GameSample]:
+    """
+    Run multiple self-play games in parallel with batched GPU inference.
+    Much higher GPU utilization than sequential self-play.
+    """
+    # Create inference server
+    server = BatchedInferenceServer(network, device, cfg)
+    server.start()
+
+    results = []
+    results_lock = threading.Lock()
+
+    try:
+        # Run games in thread pool
+        with ThreadPoolExecutor(max_workers=cfg.num_gpu_games) as executor:
+            futures = []
+            for i in range(num_games):
+                future = executor.submit(
+                    _batched_self_play_worker,
+                    server, cfg, i, results, results_lock
+                )
+                futures.append(future)
+
+            # Wait for all games with progress
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                try:
+                    future.result()  # Raise any exceptions
+                    print(f"  Game {completed}/{num_games} completed")
+                except Exception as e:
+                    print(f"  Game {completed}/{num_games} failed: {e}")
+    finally:
+        server.stop()
+
+    return results
+
 
 # ============================================================================
 # Self-Play
@@ -879,21 +1228,32 @@ def train_alphazero(cfg: Optional[Config] = None, resume_from: Optional[str] = N
         iteration += 1
         print(f"\n=== Iteration {iteration} ===")
 
-        # Self-play phase - use parallel execution
-        # Parallel self-play works for CPU and MPS (uses CPU workers with model copy)
-        use_parallel = device.type in ('cpu', 'mps') and cfg.num_parallel_games > 1
-        print(f"Self-play ({'parallel' if use_parallel else 'sequential'} on {cfg.num_parallel_games} workers)...")
+        # Self-play phase
         network.eval()
 
-        # More games per iteration on GPU due to faster inference
-        games_per_iteration = 3 if device.type == 'cpu' else (5 if device.type == 'mps' else 10)
+        # Games per iteration depends on device
+        if device.type == 'cuda':
+            games_per_iteration = cfg.num_gpu_games
+        elif device.type == 'mps':
+            games_per_iteration = 5
+        else:
+            games_per_iteration = 3
 
-        if use_parallel:
+        if device.type == 'cuda':
+            # CUDA: Use batched GPU inference for high utilization
+            print(f"Self-play (batched GPU, {cfg.num_gpu_games} parallel games)...")
+            samples = batched_gpu_self_play(network, device, cfg, games_per_iteration)
+            replay_buffer.add(samples)
+            print(f"  Total samples collected: {len(samples)}")
+        elif device.type in ('cpu', 'mps') and cfg.num_parallel_games > 1:
+            # CPU/MPS: Use parallel CPU workers
+            print(f"Self-play (parallel on {cfg.num_parallel_games} CPU workers)...")
             samples = parallel_self_play(network, cfg, games_per_iteration)
             replay_buffer.add(samples)
             print(f"  Total samples collected: {len(samples)}")
         else:
-            # Sequential self-play (CUDA uses GPU directly)
+            # Fallback: Sequential self-play
+            print(f"Self-play (sequential)...")
             for game_num in range(games_per_iteration):
                 samples = self_play_game(mcts, cfg)
                 replay_buffer.add(samples)
